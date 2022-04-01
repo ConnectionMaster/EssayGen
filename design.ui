@@ -17,7 +17,7 @@
    </font>
   </property>
   <property name="windowTitle">
-   <string>EssayGen v1.3.0</string>
+   <string>EssayGen v1.4.1-beta - Processing...</string>
   </property>
   <widget class="QWidget" name="centralwidget">
    <property name="font">
@@ -239,7 +239,7 @@
            <item row="0" column="0">
             <widget class="QLabel" name="label_2">
              <property name="text">
-              <string>Starting TOR instance...</string>
+              <string>Processing...</string>
              </property>
             </widget>
            </item>

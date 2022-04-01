@@ -1,31 +1,43 @@
 from PyQt5.QtWidgets import QMainWindow, QApplication
-from PyQt5 import QtWidgets, QtGui, QtCore
-from PyQt5 import uic
-import os, sys
-from threading import Thread
+from multiprocessing import Process, Queue as MPQueue
 from queue import Queue, Empty
-from random import randint
-from torrequest_fix import TorRequest
-import json
-import re
-from tkinter import messagebox
-import tkinter as tk
+import os, sys
 
-root = tk.Tk()
-root.withdraw()
+if __name__ == "__main__":
+    from PyQt5 import QtWidgets, QtGui, QtCore
+    from PyQt5 import uic
+    from threading import Thread
+    from random import randint
+    from torrequest_fix import TorRequest
+    import json
+    import re
+    from tkinter import messagebox
+    import tkinter as tk
+    
+    root = tk.Tk()
+    root.withdraw()
+    
+    headers = {
+        "Host": "api.shortlyai.com",
+        "Content-Length": None,
+        "Sec-Ch-Ua": "\"(Not(A:Brand\";v=\"8\", \"Chromium\";v=\"99\"",
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json;charset=UTF-8",
+        "Sec-Ch-Ua-Mobile": "?0",
+        "User-Agent": None,
+        "Sec-Ch-Ua-Platform": "\"Windows\"",
+        "Origin": "https://www.shortlyai.com",
+        "Sec-Fetch-Site": "same-site",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "Referer": "https://www.shortlyai.com/",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept-Language": "en-US,en;q=0.9"
+        }
 
-headers = {
-    "Accept":           "application/json, text/plain, */*",
-    "Accept-Language":  "en-US,en;q=0.5",
-    "Authorization":    None,         # placeholder
-    "Connection":       "keep-alive",
-    "Content-Length":   None,         # placeholder
-    "Content-Type":     "application/json;charset=utf-8",
-    "Host":             "api.shortlyai.com",
-    "Origin":           "https://shortlyai.com",
-    "Referer":          "https://shortlyai.com/",
-    "User-Agent":       "Mozilla/5.0 (Windows NT 10.0; rv:78.0) Gecko/20100101 Firefox/78.0",
-}
+
+import cloudflare_solver
+
 
 special_commands = {
     'instruct':  200,
@@ -33,7 +45,6 @@ special_commands = {
     'shorten':   200,
     'expand':    120,
 }
-
 
 random_str = lambda char_len: ''.join(chr(randint(97, 122)) for _ in range(char_len))
 
@@ -64,7 +75,6 @@ class UI(QMainWindow):
         self.article_check    = self.findChild(QtWidgets.QRadioButton, "radioButton")
         self.story_check      = self.findChild(QtWidgets.QRadioButton, "radioButton_2")
         self.output_len_slider = self.findChild(QtWidgets.QSlider, "horizontalSlider")
-        self.scrollbar        = self.content.verticalScrollBar()
 
         # dividers
         if dark_mode:
@@ -76,7 +86,14 @@ class UI(QMainWindow):
             
 
         # set connections
-        self.generate.clicked.connect(lambda: self.run_thread(self.amount_of_runs.value()))
+        self.generate.clicked.connect(lambda: self._command_shortcut())
+        
+        QtWidgets.QShortcut(QtGui.QKeySequence('Ctrl+Return'), self).activated.connect(lambda: self._command_shortcut())
+        QtWidgets.QShortcut(QtGui.QKeySequence('Ctrl+P'), self).activated.connect(lambda: self._command_shortcut('rewrite'))
+        QtWidgets.QShortcut(QtGui.QKeySequence('Ctrl+['), self).activated.connect(lambda: self._command_shortcut('shorten'))
+        QtWidgets.QShortcut(QtGui.QKeySequence('Ctrl+]'), self).activated.connect(lambda: self._command_shortcut('expand'))
+        QtWidgets.QShortcut(QtGui.QKeySequence('Ctrl+Shift+C'), self).activated.connect(lambda: self._show_writing_stats())
+        
         self.article_check.toggled.connect(lambda: self.set_essay_background_placeholders())
         self.story_check.toggled.connect(lambda: self.set_essay_background_placeholders())
 
@@ -122,7 +139,117 @@ class UI(QMainWindow):
     status_queue    = Queue()
     content_queue   = Queue()
 
-    def run_thread(self, amount):
+    def _show_writing_stats(self):
+        content         = self.content.toPlainText().replace('\u2029', '\n')
+        selected_text   = self.content.textCursor().selectedText().replace('\u2029', '\n')
+        messagebox.showinfo(
+            'EssayGen - Writing Stats',
+            (
+                "Selected character count:\t  "     + str(len(selected_text)) +
+                "\nSelected chars (no spaces):\t  " + str(len(re.sub(r'\s', '', selected_text))) +
+                "\nSelected word count:\t  "        + str(len(selected_text.split()))
+            ) if selected_text else (
+                "Character count:\t   "     + str(len(content)) +
+                "\nChars (no spaces):\t   " + str(len(re.sub(r'\s', '', content))) +
+                "\nWord count:\t   "        + str(len(content.split()))
+            )
+        )
+        self.activateWindow()
+        
+    _running = False
+    def _command_shortcut(self, key='instruct'):
+        if self._running:
+            return
+        cursor = self.content.textCursor()
+        selection = cursor.selectedText()
+        stripped = self._multistrip(selection)
+        
+        if not stripped:
+            if key == 'instruct':
+                self.run_thread(self.amount_of_runs.value())
+            return
+        elif re.search(f'/({"|".join(special_commands.keys())})'+'\\ \\[[^\n\u2029]+\\]', stripped, flags=re.IGNORECASE):
+            if messagebox.askyesno('EssayGen - Error', 'Commands cannot be nested. Would you like to run the selected commands instead?'):
+                nested_commands = self._check_for_commands(stripped, self.content.toPlainText())
+                if nested_commands == 1:
+                    return
+                self.run_thread(self.amount_of_runs.value(), nested_commands)
+            self.activateWindow()
+            return
+        elif '\u2029' in stripped or '\n' in stripped:
+            messagebox.showerror('EssayGen - Error', 'Commands can not contain line breaks.')
+            self.activateWindow()
+            return
+        
+        cursor.beginEditBlock()
+        cmd = f'/{key} [{stripped}]'
+        cursor.removeSelectedText()
+        cursor.insertText(
+            selection.split(stripped)[0]
+            + cmd +
+            selection.split(stripped)[-1]
+        )
+        cursor.endEditBlock()
+        
+        if self._over_charlimit(key, cmd, stripped):
+            return
+        
+        self._running = True
+        self.run_thread(self.amount_of_runs.value(), [(key, cmd, selection)])
+        self._running = False
+        
+
+    def _multistrip(self, nstring):
+        # strip mutliple characters from the start of a string
+        for s in nstring:
+            if s in ' \n\t\r,.;:!?\u2029': nstring = nstring[1:]
+            else: break
+        for s in nstring[::-1]:
+            if s in ' \n\t\r\u2029': nstring = nstring[:-1]
+            else: break
+        return nstring
+                
+
+    def _over_charlimit(self, cmd_type, cmd, cmd_text):
+        if len(cmd_text) > special_commands[cmd_type]:
+            excess_chars = len(cmd_text) - special_commands[cmd_type]
+            if messagebox.askyesno('EssayGen - Input Error', f'The {cmd_type} command cannot exceed {special_commands[cmd_type]} characters. Would you like to highlight the excess {excess_chars} character{"s" if excess_chars != 1 else ""}?'):
+                cmd_pos = self.content.toPlainText().find(cmd) + len(cmd_type) + 3
+                cmd_end = cmd_pos + len(cmd_text)
+                cursor = self.content.textCursor()
+                cursor.setPosition(cmd_pos + special_commands[cmd_type], QtGui.QTextCursor.MoveAnchor)
+                cursor.setPosition(cmd_end, QtGui.QTextCursor.KeepAnchor)
+                self.content.setTextCursor(cursor)
+            self.activateWindow()
+            return True
+        
+        
+    def _check_for_commands(self, content, full_content=None):
+        _multi_run_warning = True
+        special_runs = []
+        for cmd_type in special_commands:
+            cmds = re.findall('/'+cmd_type+'\\ \\[[^\n\u2029]+\\]', content, flags=re.IGNORECASE)
+            for cmd in cmds:
+                # remove /command [] using re
+                cmd_text = cmd[len(cmd_type)+3:-1]
+                if self._over_charlimit(cmd_type, cmd, cmd_text):
+                    return 1 # error
+                if (
+                    full_content
+                    and full_content.count(cmd) > 1
+                    and _multi_run_warning
+                ):
+                    warning = messagebox.askokcancel('EssayGen - Error', 'You cannot have multiple instances of the same command. Continuing will ONLY run the first instance in the text.')
+                    self.activateWindow()
+                    if warning:
+                        _multi_run_warning = False # only warn once
+                    else:
+                        return 1
+                special_runs.append((cmd_type, cmd, cmd_text))
+        return special_runs
+
+
+    def run_thread(self, amount, shortcut_command=False):
         topic    = self.topic.text().strip()
         content  = self.content.toPlainText().strip()
         story_bg = self.story_background.toPlainText().strip()
@@ -130,23 +257,18 @@ class UI(QMainWindow):
         # check inputs for errors
         if not any([topic, story_bg, content]):
             messagebox.showerror('EssayGen - Input Error', 'Please enter text in at least one field.')
+            self.activateWindow()
             return
         elif len(story_bg) > 500:
             messagebox.showerror('EssayGen - Input Error', 'The content background field cannot exceed 500 characters. Please try again.')
+            self.activateWindow()
             return
 
         # check for special commands
-        special_runs = []
-        for cmd_type, charlimit in special_commands.items():
-            cmds = re.findall('/'+cmd_type+'\\ \\[[^\n]+\\]', content, flags=re.IGNORECASE)
-            for cmd in cmds:
-                # remove /command [] using re
-                cmd_text = cmd[len(cmd_type)+3:-1]
-                if len(cmd_text) > charlimit:
-                    messagebox.showerror('EssayGen - Input Error', f'The {cmd_type} command cannot exceed {charlimit} characters. Please try again.')
-                    return
-                special_runs.append((cmd_type, cmd, cmd_text))
-        if special_runs:
+        special_runs = shortcut_command or self._check_for_commands(content)
+        if special_runs == 1:
+            return
+        elif special_runs:
             amount = len(special_runs)
         
         # disable editing in text boxes
@@ -168,6 +290,7 @@ class UI(QMainWindow):
                 # show error messages
                 if status_message.startswith('Error:'):
                     messagebox.showerror('EssayGen - Run error', status_message)
+                    self.activateWindow()
                     self.status_label.setText(status_message.split('.')[0]) # first sentence
                 else:
                     self.status_label.setText(status_message)
@@ -177,25 +300,36 @@ class UI(QMainWindow):
             except Empty:
                 pass
             else:
-                scrollval   = self.scrollbar.value()
+                scrollval   = self.content.verticalScrollBar().value()
                 old_content = self.content.toPlainText()
 
+                # insert content using cursor
+                cursor = self.content.textCursor()
+                cursor.beginEditBlock()
+                
                 if cmd:
                     cmd_pos_start = old_content.find(cmd)
                     cmd_pos_end   = cmd_pos_start + len(cmd)
-                    self.content.setPlainText(old_content[:cmd_pos_start] +content+ old_content[cmd_pos_end:]) # set text
-                    self.content.textCursor().setPosition(cmd_pos_start + len(content))
-                else:
-                    self.content.textCursor().insertText(content)
-            
-                # not sure why it needs to be ran twice, possibly a PyQt bug
-                self.scrollbar.setValue(scrollval)
-                self.scrollbar.setValue(scrollval)
+                    
+                    # remove the command
+                    cursor.setPosition(cmd_pos_start, QtGui.QTextCursor.MoveAnchor)
+                    cursor.setPosition(cmd_pos_end, QtGui.QTextCursor.KeepAnchor)
+                    cursor.removeSelectedText()
+                    cursor.setPosition(cmd_pos_start)
+                    
+                cursor.insertText(content)
+                cursor.endEditBlock()
+                # set text cursor
+                self.content.setTextCursor(cursor)
+                
+                # set text scrollbar to same position
+                scrollbar = QtWidgets.QScrollBar()
+                scrollbar.setValue(scrollval)
+                self.content.setVerticalScrollBar(scrollbar)
 
                 self.content_queue.task_done()
 
             QtWidgets.QApplication.processEvents() # update interface
-            
             
         # re enable editing in text boxes
         self.toggle_text_boxes(True)
@@ -222,29 +356,42 @@ class UI(QMainWindow):
     reset_ident = False    
     starting_tor_instance = Queue()
     
+    
     def _start_tor_instance_async(self):
         t = Thread(target=self.start_tor_instance)
         t.daemon = True
         t.start()
     
     def start_tor_instance(self, set_reset_ident=False):
+        self.setWindowTitle('EssayGen v1.4.1-beta - Starting TOR Instance...')
         self.tr = TorRequest(tor_cmd=self.tor_cmd)
         self.reset_ident = set_reset_ident
-        self.starting_tor_instance.put('_')
+        self.setWindowTitle('EssayGen v1.4.1-beta - Running Cloudflare Challenge...')
+        q = MPQueue()
+        p = Process(target=cloudflare_solver.run, args=(q,))
+        p.daemon = True
+        p.start()
+        if h := q.get():
+            headers['User-Agent'] = h
+            self.setWindowTitle('EssayGen v1.4.1-beta - Ready')
+            self.starting_tor_instance.put('_')
+        else:
+            os._exit(0)
+        p.terminate()
         
 
-    def run(self, amount, special_runs=[]):
+    def run(self, amount, special_runs=None):
         original_amount = amount
 
         if self.starting_tor_instance.empty():
-            self.status_queue.put_nowait('Starting TOR instance...')
+            self.status_queue.put_nowait('Processing...')
             try:
-                self.starting_tor_instance.get(timeout=10)
+                self.starting_tor_instance.get(timeout=100)
             except Empty:
+                self.setWindowTitle('EssayGen v1.4.1-beta - Failed')
                 self.return_error_msgbox('Error: TOR instance failed to start')
                 return
             
-
         while amount > 0:
             # create account
             if self.runs_left == 0:
@@ -253,13 +400,15 @@ class UI(QMainWindow):
                     self.start_tor_instance(set_reset_ident=True)
                 self.status_queue.put_nowait('Registering new account over TOR...')
                 passwrd = random_str(15)
-                create_acc = self.tr.post('https://api.shortlyai.com/auth/register/', data={
+                data = {
                     "email":      f"{random_str(randint(8, 12))}{str(randint(0, 999)).rjust(3, '0')}@{random_str(10)}.com",
                     "password1":  passwrd,
                     "password2":  passwrd,
                     "first_name": random_str(randint(8, 15)),
                     "last_name":  random_str(randint(8, 15))
-                }).json()
+                }
+                headers['Content-Length'] = str(len(str(data)))
+                create_acc = self.tr.post('https://api.shortlyai.com/auth/register/', data=json.dumps(data), headers=headers).json()
                 if create_acc.get('token'):
                     self.runs_left = 4
                     self.token = create_acc['token']
@@ -270,7 +419,7 @@ class UI(QMainWindow):
             # generate
             for _ in range(min(amount, 4)):
                 self.status_queue.put_nowait('Generating text...'+ (
-                    f' (run {(original_amount - amount) + 1}/{original_amount})'
+                    f' ({"command" if special_runs else "run"} {(original_amount - amount) + 1}/{original_amount})'
                     if (original_amount-amount, original_amount) != (0, 1)
                     else ''
                 ))
@@ -373,41 +522,41 @@ def detect_darkmode_in_windows(): # automatically detect dark mode
     return False
 
 
-
-# initialize app
-app = QApplication(sys.argv)
-
-
-# dark mode palette ------------------------------
-app.setStyle('Fusion')
-
-light_palette = QtGui.QPalette()
-
-if detect_darkmode_in_windows():
-    dark_mode = True
-    dark_palette = QtGui.QPalette()
-    dark_palette.setColor(QtGui.QPalette.Window, QtGui.QColor(25,35,45))
-    dark_palette.setColor(QtGui.QPalette.WindowText, QtCore.Qt.white)
-    dark_palette.setColor(QtGui.QPalette.Base, QtGui.QColor(39, 49, 58))
-    dark_palette.setColor(QtGui.QPalette.AlternateBase, QtGui.QColor(25,35,45))
-    dark_palette.setColor(QtGui.QPalette.ToolTipBase, QtCore.Qt.white)
-    dark_palette.setColor(QtGui.QPalette.ToolTipText, QtCore.Qt.white)
-    dark_palette.setColor(QtGui.QPalette.Text, QtCore.Qt.white)
-    dark_palette.setColor(QtGui.QPalette.Button, QtGui.QColor(25,35,45))
-    dark_palette.setColor(QtGui.QPalette.ButtonText, QtCore.Qt.white)
-    dark_palette.setColor(QtGui.QPalette.BrightText, QtCore.Qt.blue)
-    dark_palette.setColor(QtGui.QPalette.Highlight, QtGui.QColor(20, 129, 216))
-    dark_palette.setColor(QtGui.QPalette.HighlightedText, QtCore.Qt.white)
-    app.setPalette(dark_palette)
-else:
-    dark_mode = False
-
-# fonts
-QtGui.QFontDatabase.addApplicationFont(resource_path('fonts\\Poppins-Medium.ttf'))
-QtGui.QFontDatabase.addApplicationFont(resource_path('fonts\\Poppins-Regular.ttf'))
+if __name__ == "__main__":
+    # initialize app
+    app = QApplication(sys.argv)
 
 
-MainWindow = QtWidgets.QMainWindow()
+    # dark mode palette ------------------------------
+    app.setStyle('Fusion')
 
-window = UI()
-app.exec_()
+    light_palette = QtGui.QPalette()
+
+    if detect_darkmode_in_windows():
+        dark_mode = True
+        dark_palette = QtGui.QPalette()
+        dark_palette.setColor(QtGui.QPalette.Window, QtGui.QColor(25,35,45))
+        dark_palette.setColor(QtGui.QPalette.WindowText, QtCore.Qt.white)
+        dark_palette.setColor(QtGui.QPalette.Base, QtGui.QColor(39, 49, 58))
+        dark_palette.setColor(QtGui.QPalette.AlternateBase, QtGui.QColor(25,35,45))
+        dark_palette.setColor(QtGui.QPalette.ToolTipBase, QtCore.Qt.white)
+        dark_palette.setColor(QtGui.QPalette.ToolTipText, QtCore.Qt.white)
+        dark_palette.setColor(QtGui.QPalette.Text, QtCore.Qt.white)
+        dark_palette.setColor(QtGui.QPalette.Button, QtGui.QColor(25,35,45))
+        dark_palette.setColor(QtGui.QPalette.ButtonText, QtCore.Qt.white)
+        dark_palette.setColor(QtGui.QPalette.BrightText, QtCore.Qt.blue)
+        dark_palette.setColor(QtGui.QPalette.Highlight, QtGui.QColor(20, 129, 216))
+        dark_palette.setColor(QtGui.QPalette.HighlightedText, QtCore.Qt.white)
+        app.setPalette(dark_palette)
+    else:
+        dark_mode = False
+
+    # fonts
+    QtGui.QFontDatabase.addApplicationFont(resource_path('fonts\\Poppins-Medium.ttf'))
+    QtGui.QFontDatabase.addApplicationFont(resource_path('fonts\\Poppins-Regular.ttf'))
+
+
+    MainWindow = QtWidgets.QMainWindow()
+
+    window = UI()
+    app.exec_()
